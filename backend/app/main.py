@@ -71,31 +71,72 @@ async def chat_stream(request: ChatRequest):
 
 @app.get("/sessions", response_model=list[SessionResponse])
 async def list_sessions(
+    user_id: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
     order_by: Literal["created_at", "updated_at", "message_count"] = "updated_at",
 ):
-    """List all sessions sorted by time descending."""
+    """List sessions, optionally filtered by user_id."""
     memory_settings = get_memory_settings()
     memory_client = MemoryClient(memory_settings)
     await memory_client.connect()
     try:
-        sessions = await memory_client.short_term.list_sessions(
-            limit=limit,
-            order_by=order_by,
-            order_dir="desc",
-        )
-        return [
-            SessionResponse(
-                session_id=s.session_id,
-                title=s.title,
-                created_at=s.created_at,
-                updated_at=s.updated_at,
-                message_count=s.message_count,
-                first_message_preview=s.first_message_preview,
-                last_message_preview=s.last_message_preview,
+        if user_id:
+            # Filter sessions that have at least one message from this user
+            results = await memory_client.short_term._client.execute_read(
+                """
+                MATCH (c:Conversation)-[:HAS_MESSAGE]->(m:Message)
+                WHERE m.metadata IS NOT NULL AND m.metadata CONTAINS 'user_id'
+                WITH c, m, apoc.convert.fromJsonMap(m.metadata) AS meta
+                WHERE meta.user_id = $user_id
+                WITH c, m ORDER BY m.created_at ASC
+                WITH c,
+                     count(m) AS message_count,
+                     min(m.created_at) AS created_at,
+                     max(m.created_at) AS updated_at,
+                     head(collect(m.content)) AS first_msg,
+                     last(collect(m.content)) AS last_msg
+                RETURN c.session_id AS session_id,
+                       c.title AS title,
+                       created_at,
+                       updated_at,
+                       message_count,
+                       first_msg AS first_message_preview,
+                       last_msg AS last_message_preview
+                ORDER BY updated_at DESC
+                LIMIT $limit
+                """,
+                {"user_id": user_id, "limit": limit},
             )
-            for s in sessions
-        ]
+            return [
+                SessionResponse(
+                    session_id=r["session_id"],
+                    title=r.get("title"),
+                    created_at=r.get("created_at"),
+                    updated_at=r.get("updated_at"),
+                    message_count=r.get("message_count", 0),
+                    first_message_preview=r.get("first_message_preview"),
+                    last_message_preview=r.get("last_message_preview"),
+                )
+                for r in results
+            ]
+        else:
+            sessions = await memory_client.short_term.list_sessions(
+                limit=limit,
+                order_by=order_by,
+                order_dir="desc",
+            )
+            return [
+                SessionResponse(
+                    session_id=s.session_id,
+                    title=s.title,
+                    created_at=s.created_at,
+                    updated_at=s.updated_at,
+                    message_count=s.message_count,
+                    first_message_preview=s.first_message_preview,
+                    last_message_preview=s.last_message_preview,
+                )
+                for s in sessions
+            ]
     finally:
         await memory_client.close()
 

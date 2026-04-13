@@ -47,9 +47,12 @@ def fetch_users() -> list[str]:
     return []
 
 
-def fetch_sessions() -> list[dict]:
+def fetch_sessions(user_id: str | None = None) -> list[dict]:
     try:
-        resp = httpx.get(f"{API_URL}/sessions", timeout=10.0)
+        params = {}
+        if user_id:
+            params["user_id"] = user_id
+        resp = httpx.get(f"{API_URL}/sessions", params=params, timeout=10.0)
         if resp.status_code == 200:
             return resp.json()
     except Exception:
@@ -98,6 +101,10 @@ def stream_response(prompt: str, session_id: str, user_id: str) -> dict:
 
                     etype = event.get("type")
                     if etype == "done":
+                        break
+                    elif etype == "error":
+                        full_response += f"\n\n**Error:** {event.get('content', 'Unknown error')}"
+                        text_placeholder.markdown(full_response)
                         break
                     elif etype == "tool_call":
                         tc_id = event.get("id", "")
@@ -153,14 +160,14 @@ with st.sidebar:
     st.header("Settings")
 
     existing_users = fetch_users()
-    user_id = st.selectbox(
-        "User ID",
-        options=existing_users or [],
-        index=None,
-        placeholder="Select or type a user ID...",
-    )
-    custom_user = st.text_input("Or enter new user ID")
-    user_id = custom_user.strip() if custom_user.strip() else (user_id or "default-user")
+    NEW_USER_OPTION = "+ New user..."
+    options = existing_users + [NEW_USER_OPTION] if existing_users else [NEW_USER_OPTION]
+    selected = st.selectbox("User", options, index=0)
+    if selected == NEW_USER_OPTION:
+        user_id = st.text_input("New User ID", placeholder="Enter a new user ID")
+        user_id = user_id.strip() or "default-user"
+    else:
+        user_id = selected
 
     st.divider()
 
@@ -170,7 +177,7 @@ with st.sidebar:
         st.rerun()
 
     st.subheader("Sessions")
-    sessions = fetch_sessions()
+    sessions = fetch_sessions(user_id=user_id)
 
     known_ids = {s["session_id"] for s in sessions}
     if st.session_state.session_id not in known_ids:

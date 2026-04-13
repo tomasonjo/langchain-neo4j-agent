@@ -67,9 +67,18 @@ You have tools to interact with the user's memory/context graph:
 ## Memory Context
 {memory_context}
 
-## Guidelines
+## Cypher Query Guidelines
 - Use the Neo4j tools to explore the database schema first if you're unsure about the structure.
 - Write efficient Cypher queries.
+- Do NOT use SQL syntax in Cypher. Common mistakes to avoid:
+  - No `NULLS LAST` or `NULLS FIRST` — these are not valid Cypher. If you need to handle nulls \
+in ordering, use `CASE WHEN prop IS NULL THEN 1 ELSE 0 END` as a secondary sort key, or filter \
+nulls with a `WHERE prop IS NOT NULL` clause before ordering.
+  - No `GROUP BY` — use aggregation functions directly in RETURN (e.g., `RETURN label, count(*)`).
+  - No `HAVING` — use `WITH` + `WHERE` after aggregation instead.
+  - No `SELECT`, `FROM`, `JOIN` — use `MATCH` patterns instead.
+
+## General Guidelines
 - When users express preferences or important facts, use save_user_preference to remember them.
 - Use get_user_preferences and search_memory_entities to personalize your responses.
 - Be concise and helpful.
@@ -254,73 +263,82 @@ async def run_agent_stream(
         full_response = ""
         seen_tool_calls = set()
         seen_tool_results = set()
+        chunk = None
 
-        async for chunk in agent.astream(
-            {"messages": [HumanMessage(content=user_message)]},
-            stream_mode="values",
-        ):
-            messages = chunk["messages"]
-            latest = messages[-1]
+        try:
+            async for chunk in agent.astream(
+                {"messages": [HumanMessage(content=user_message)]},
+                stream_mode="values",
+            ):
+                messages = chunk["messages"]
+                latest = messages[-1]
 
-            # Emit tool calls from AIMessage
-            if isinstance(latest, AIMessage) and latest.tool_calls:
-                for tc in latest.tool_calls:
-                    tc_id = tc.get("id", "")
-                    if tc_id not in seen_tool_calls:
-                        seen_tool_calls.add(tc_id)
+                # Emit tool calls from AIMessage
+                if isinstance(latest, AIMessage) and latest.tool_calls:
+                    for tc in latest.tool_calls:
+                        tc_id = tc.get("id", "")
+                        if tc_id not in seen_tool_calls:
+                            seen_tool_calls.add(tc_id)
+                            yield json.dumps({
+                                "type": "tool_call",
+                                "id": tc_id,
+                                "name": tc["name"],
+                                "args": tc["args"],
+                            })
+
+                # Emit tool results from ToolMessage
+                if isinstance(latest, ToolMessage):
+                    if latest.id not in seen_tool_results:
+                        seen_tool_results.add(latest.id)
+                        content = latest.content
+                        if not isinstance(content, str):
+                            content = json.dumps(content, indent=2)
+                        if len(content) > 2000:
+                            content = content[:2000] + "... (truncated)"
                         yield json.dumps({
-                            "type": "tool_call",
-                            "id": tc_id,
-                            "name": tc["name"],
-                            "args": tc["args"],
+                            "type": "tool_result",
+                            "tool_call_id": latest.tool_call_id or "",
+                            "name": latest.name or "",
+                            "content": content,
                         })
 
-            # Emit tool results from ToolMessage
-            if isinstance(latest, ToolMessage):
-                if latest.id not in seen_tool_results:
-                    seen_tool_results.add(latest.id)
-                    content = latest.content
-                    if not isinstance(content, str):
-                        content = json.dumps(content, indent=2)
-                    if len(content) > 2000:
-                        content = content[:2000] + "... (truncated)"
-                    yield json.dumps({
-                        "type": "tool_result",
-                        "tool_call_id": latest.tool_call_id or "",
-                        "name": latest.name or "",
-                        "content": content,
-                    })
-
-            # Stream AI text tokens
-            if isinstance(latest, AIMessage) and latest.content:
-                new_content = latest.content[len(full_response):]
-                if new_content:
-                    full_response = latest.content
-                    yield json.dumps({
-                        "type": "token",
-                        "content": new_content,
-                    })
+                # Stream AI text tokens
+                if isinstance(latest, AIMessage) and latest.content:
+                    new_content = latest.content[len(full_response):]
+                    if new_content:
+                        full_response = latest.content
+                        yield json.dumps({
+                            "type": "token",
+                            "content": new_content,
+                        })
+        except Exception as e:
+            yield json.dumps({
+                "type": "error",
+                "content": str(e),
+            })
+            return
 
         # Collect tool usage for metadata storage
         tool_uses = []
-        tool_calls_by_id = {}
-        for msg in chunk["messages"]:
-            if isinstance(msg, AIMessage) and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    tool_calls_by_id[tc.get("id", "")] = tc
-            if isinstance(msg, ToolMessage) and msg.tool_call_id:
-                tc = tool_calls_by_id.get(msg.tool_call_id)
-                if tc:
-                    result_preview = msg.content
-                    if not isinstance(result_preview, str):
-                        result_preview = json.dumps(result_preview, indent=2)
-                    if len(result_preview) > 500:
-                        result_preview = result_preview[:500] + "..."
-                    tool_uses.append({
-                        "name": tc["name"],
-                        "args": tc["args"],
-                        "result": result_preview,
-                    })
+        if chunk is not None:
+            tool_calls_by_id = {}
+            for msg in chunk["messages"]:
+                if isinstance(msg, AIMessage) and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tool_calls_by_id[tc.get("id", "")] = tc
+                if isinstance(msg, ToolMessage) and msg.tool_call_id:
+                    tc = tool_calls_by_id.get(msg.tool_call_id)
+                    if tc:
+                        result_preview = msg.content
+                        if not isinstance(result_preview, str):
+                            result_preview = json.dumps(result_preview, indent=2)
+                        if len(result_preview) > 500:
+                            result_preview = result_preview[:500] + "..."
+                        tool_uses.append({
+                            "name": tc["name"],
+                            "args": tc["args"],
+                            "result": result_preview,
+                        })
 
         await store_interaction(
             memory_client, session_id, user_id, user_message, full_response,
