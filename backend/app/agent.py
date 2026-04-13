@@ -1,16 +1,14 @@
 """LangChain agent with Neo4j MCP tools and Neo4j Agent Memory."""
 
 import json
-from datetime import datetime
 
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_mcp_adapters.tools import load_mcp_tools
-from langgraph.prebuilt import create_react_agent
 from neo4j_agent_memory import MemoryClient, MemorySettings
 
+from app.memory_tools import create_memory_tools
 from app.config import (
     NEO4J_URI,
     NEO4J_USERNAME,
@@ -19,16 +17,16 @@ from app.config import (
     NEO4J_MEMORY_URI,
     NEO4J_MEMORY_USERNAME,
     NEO4J_MEMORY_PASSWORD,
+    OPENAI_MODEL,
 )
-from app.memory import Neo4jChatMessageHistory
 
 
 def get_mcp_config() -> dict:
     """Build MCP server config using env vars."""
     return {
         "neo4j": {
-            "command": "npx",
-            "args": ["-y", "@neo4j/mcp-neo4j"],
+            "command": "uvx",
+            "args": ["neo4j-mcp-server"],
             "env": {
                 "NEO4J_URI": NEO4J_URI,
                 "NEO4J_USERNAME": NEO4J_USERNAME,
@@ -46,14 +44,25 @@ def get_memory_settings() -> MemorySettings:
             "uri": NEO4J_MEMORY_URI,
             "username": NEO4J_MEMORY_USERNAME,
             "password": NEO4J_MEMORY_PASSWORD,
-        }
+        },
+        extraction={
+            "extractor_type": "gliner",
+        },
     )
 
 
-SYSTEM_PROMPT = """You are a helpful assistant with access to a Neo4j graph database via MCP tools.
+SYSTEM_PROMPT = """You are a helpful assistant with access to a Neo4j graph database via MCP tools \
+and a persistent memory system.
 
-You can query the database to answer user questions. Use the available Neo4j MCP tools
-to read the schema, run Cypher queries, and retrieve data.
+## Neo4j Database Tools
+Use the Neo4j MCP tools to read the schema, run Cypher queries, and retrieve data.
+
+## Memory Tools
+You have tools to interact with the user's memory/context graph:
+- **search_memory_entities**: Search the knowledge graph for entities
+- **get_user_preferences**: Retrieve stored user preferences to personalize responses
+- **save_user_preference**: Save new preferences when the user expresses likes/dislikes
+- **search_conversation_history**: Search past conversation messages for context
 
 ## Memory Context
 {memory_context}
@@ -61,8 +70,8 @@ to read the schema, run Cypher queries, and retrieve data.
 ## Guidelines
 - Use the Neo4j tools to explore the database schema first if you're unsure about the structure.
 - Write efficient Cypher queries.
-- When users express preferences or important facts about themselves, acknowledge them.
-- Reference information from past conversations when relevant.
+- When users express preferences or important facts, use save_user_preference to remember them.
+- Use get_user_preferences and search_memory_entities to personalize your responses.
 - Be concise and helpful.
 """
 
@@ -73,7 +82,7 @@ async def get_memory_context(
     user_id: str,
     current_message: str,
 ) -> str:
-    """Retrieve memory context: conversation history, user facts, and preferences."""
+    """Retrieve memory context: conversation history, user preferences, and entities."""
     parts = []
 
     # Get conversation history (short-term)
@@ -83,7 +92,7 @@ async def get_memory_context(
         )
         if conversation.messages:
             history_lines = []
-            for msg in conversation.messages[-10:]:  # Last 10 messages
+            for msg in conversation.messages[-10:]:
                 history_lines.append(f"  {msg.role}: {msg.content}")
             parts.append(
                 "### Recent Conversation History\n" + "\n".join(history_lines)
@@ -93,8 +102,9 @@ async def get_memory_context(
 
     # Get user preferences (long-term)
     try:
-        preferences = await memory_client.long_term.get_preferences(
-            user_id=user_id,
+        preferences = await memory_client.long_term.search_preferences(
+            query=current_message,
+            limit=10,
         )
         if preferences:
             pref_lines = [
@@ -135,23 +145,27 @@ async def store_interaction(
     user_id: str,
     user_message: str,
     assistant_message: str,
+    tool_uses: list[dict] | None = None,
 ) -> None:
     """Store the interaction in memory (short-term + long-term extraction)."""
-    # Store messages in short-term memory
     await memory_client.short_term.add_message(
         session_id=session_id,
         role="user",
         content=user_message,
         metadata={"user_id": user_id},
     )
+
+    assistant_metadata = {"user_id": user_id}
+    if tool_uses:
+        assistant_metadata["tool_uses"] = tool_uses
+
     await memory_client.short_term.add_message(
         session_id=session_id,
         role="assistant",
         content=assistant_message,
-        metadata={"user_id": user_id},
+        metadata=assistant_metadata,
     )
 
-    # Extract and store user preferences from the conversation
     try:
         await memory_client.long_term.extract_and_store(
             text=f"User: {user_message}\nAssistant: {assistant_message}",
@@ -159,7 +173,6 @@ async def store_interaction(
             session_id=session_id,
         )
     except Exception:
-        # extract_and_store may not exist in all versions; silently skip
         pass
 
 
@@ -174,32 +187,29 @@ async def run_agent(
     await memory_client.connect()
 
     try:
-        # Get memory context
         memory_context = await get_memory_context(
             memory_client, session_id, user_id, user_message
         )
 
-        # Build the agent with MCP tools (session must stay alive during agent execution)
         mcp_client = MultiServerMCPClient(get_mcp_config())
-        async with mcp_client.session("neo4j") as session:
-            tools = await load_mcp_tools(session)
+        mcp_tools = await mcp_client.get_tools()
+        memory_tools = create_memory_tools(memory_client, user_id=user_id)
+        tools = mcp_tools + memory_tools
 
-            llm = ChatOpenAI(model="gpt-4o", temperature=0)
+        llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+        system_message = SYSTEM_PROMPT.format(memory_context=memory_context)
 
-            system_message = SYSTEM_PROMPT.format(memory_context=memory_context)
-            agent = create_react_agent(llm, tools, prompt=system_message)
+        agent = create_agent(llm, tools=tools, system_prompt=system_message)
 
-            result = await agent.ainvoke(
-                {"messages": [HumanMessage(content=user_message)]}
-            )
+        result = await agent.ainvoke(
+            {"messages": [HumanMessage(content=user_message)]}
+        )
 
-            # Extract the final AI response
-            ai_messages = [
-                m for m in result["messages"] if isinstance(m, AIMessage)
-            ]
-            response = ai_messages[-1].content if ai_messages else "No response."
+        ai_messages = [
+            m for m in result["messages"] if isinstance(m, AIMessage)
+        ]
+        response = ai_messages[-1].content if ai_messages else "No response."
 
-        # Store the interaction in memory
         await store_interaction(
             memory_client, session_id, user_id, user_message, response
         )
@@ -214,7 +224,14 @@ async def run_agent_stream(
     session_id: str,
     user_id: str = "default-user",
 ):
-    """Stream the agent response token by token."""
+    """Stream the agent response with tool usage events.
+
+    Yields JSON-encoded SSE events:
+      {"type": "token", "content": "..."}
+      {"type": "tool_call", "name": "...", "args": {...}}
+      {"type": "tool_result", "name": "...", "content": "..."}
+      {"type": "done"}
+    """
     memory_settings = get_memory_settings()
     memory_client = MemoryClient(memory_settings)
     await memory_client.connect()
@@ -225,29 +242,85 @@ async def run_agent_stream(
         )
 
         mcp_client = MultiServerMCPClient(get_mcp_config())
-        async with mcp_client.session("neo4j") as session:
-            tools = await load_mcp_tools(session)
-            llm = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
+        mcp_tools = await mcp_client.get_tools()
+        memory_tools = create_memory_tools(memory_client, user_id=user_id)
+        tools = mcp_tools + memory_tools
 
-            system_message = SYSTEM_PROMPT.format(memory_context=memory_context)
-            agent = create_react_agent(llm, tools, prompt=system_message)
+        llm = ChatOpenAI(model=OPENAI_MODEL, temperature=0)
+        system_message = SYSTEM_PROMPT.format(memory_context=memory_context)
 
-            full_response = ""
-            async for event in agent.astream_events(
-                {"messages": [HumanMessage(content=user_message)]},
-                version="v2",
-            ):
-                if (
-                    event["event"] == "on_chat_model_stream"
-                    and event["data"]["chunk"].content
-                ):
-                    token = event["data"]["chunk"].content
-                    full_response += token
-                    yield token
+        agent = create_agent(llm, tools=tools, system_prompt=system_message)
 
-        # Store after streaming completes
+        full_response = ""
+        seen_tool_calls = set()
+        seen_tool_results = set()
+
+        async for chunk in agent.astream(
+            {"messages": [HumanMessage(content=user_message)]},
+            stream_mode="values",
+        ):
+            messages = chunk["messages"]
+            latest = messages[-1]
+
+            # Emit tool calls from AIMessage
+            if isinstance(latest, AIMessage) and latest.tool_calls:
+                for tc in latest.tool_calls:
+                    tc_id = tc.get("id", "")
+                    if tc_id not in seen_tool_calls:
+                        seen_tool_calls.add(tc_id)
+                        yield json.dumps({
+                            "type": "tool_call",
+                            "id": tc_id,
+                            "name": tc["name"],
+                            "args": tc["args"],
+                        })
+
+            # Emit tool results from ToolMessage
+            if isinstance(latest, ToolMessage):
+                if latest.id not in seen_tool_results:
+                    seen_tool_results.add(latest.id)
+                    content = latest.content
+                    if isinstance(content, str) and len(content) > 2000:
+                        content = content[:2000] + "... (truncated)"
+                    yield json.dumps({
+                        "type": "tool_result",
+                        "tool_call_id": latest.tool_call_id or "",
+                        "name": latest.name or "",
+                        "content": content,
+                    })
+
+            # Stream AI text tokens
+            if isinstance(latest, AIMessage) and latest.content:
+                new_content = latest.content[len(full_response):]
+                if new_content:
+                    full_response = latest.content
+                    yield json.dumps({
+                        "type": "token",
+                        "content": new_content,
+                    })
+
+        # Collect tool usage for metadata storage
+        tool_uses = []
+        tool_calls_by_id = {}
+        for msg in chunk["messages"]:
+            if isinstance(msg, AIMessage) and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    tool_calls_by_id[tc.get("id", "")] = tc
+            if isinstance(msg, ToolMessage) and msg.tool_call_id:
+                tc = tool_calls_by_id.get(msg.tool_call_id)
+                if tc:
+                    result_preview = msg.content
+                    if isinstance(result_preview, str) and len(result_preview) > 500:
+                        result_preview = result_preview[:500] + "..."
+                    tool_uses.append({
+                        "name": tc["name"],
+                        "args": tc["args"],
+                        "result": result_preview,
+                    })
+
         await store_interaction(
-            memory_client, session_id, user_id, user_message, full_response
+            memory_client, session_id, user_id, user_message, full_response,
+            tool_uses=tool_uses or None,
         )
     finally:
         await memory_client.close()

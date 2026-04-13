@@ -1,11 +1,6 @@
 FROM python:3.12-slim
 
-# Install Node.js for npx (needed by Neo4j MCP server)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 WORKDIR /app
 

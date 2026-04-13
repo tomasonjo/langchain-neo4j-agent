@@ -5,6 +5,7 @@ load_dotenv()
 
 # OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 
 # Neo4j MCP Server
 NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
