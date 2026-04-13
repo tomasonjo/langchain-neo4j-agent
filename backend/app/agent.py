@@ -148,10 +148,26 @@ async def store_interaction(
     tool_uses: list[dict] | None = None,
 ) -> None:
     """Store the interaction in memory (short-term + long-term extraction)."""
-    # Save short-term conversation via the integration
-    await memory._save_context_async(
-        {"input": user_message},
-        {"output": assistant_message},
+    # Store short-term messages directly so we can attach user_id metadata.
+    # Neo4jAgentMemory._save_context_async does not support metadata, so we
+    # call the underlying client to preserve user attribution.
+    user_metadata = {"user_id": user_id}
+    await memory.memory_client.short_term.add_message(
+        session_id=memory.session_id,
+        role="user",
+        content=user_message,
+        metadata=user_metadata,
+    )
+
+    assistant_metadata: dict = {"user_id": user_id}
+    if tool_uses:
+        assistant_metadata["tool_uses"] = tool_uses
+
+    await memory.memory_client.short_term.add_message(
+        session_id=memory.session_id,
+        role="assistant",
+        content=assistant_message,
+        metadata=assistant_metadata,
     )
 
     # Long-term extraction (entities, preferences) is not handled by the
@@ -164,6 +180,66 @@ async def store_interaction(
         )
     except Exception:
         pass
+
+
+def _collect_tool_uses(messages: list) -> list[dict]:
+    """Extract tool call/result pairs from agent messages."""
+    tool_uses = []
+    tool_calls_by_id: dict[str, dict] = {}
+    for msg in messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_calls_by_id[tc.get("id", "")] = tc
+        if isinstance(msg, ToolMessage) and msg.tool_call_id:
+            tc = tool_calls_by_id.get(msg.tool_call_id)
+            if tc:
+                result_preview = msg.content
+                if not isinstance(result_preview, str):
+                    result_preview = json.dumps(result_preview, indent=2)
+                if len(result_preview) > 500:
+                    result_preview = result_preview[:500] + "..."
+                tool_uses.append({
+                    "name": tc["name"],
+                    "args": tc["args"],
+                    "result": result_preview,
+                })
+    return tool_uses
+
+
+async def store_decision_trace(
+    memory: Neo4jAgentMemory,
+    user_id: str,
+    user_message: str,
+    assistant_message: str,
+    tool_uses: list[dict],
+) -> None:
+    """Store a reasoning/decision trace when tools were called."""
+    reasoning = memory.memory_client.reasoning
+
+    trace = await reasoning.start_trace(
+        session_id=memory.session_id,
+        task=user_message,
+        metadata={"user_id": user_id},
+    )
+
+    for tool_use in tool_uses:
+        step = await reasoning.add_step(
+            trace_id=trace.id,
+            action=f"Called {tool_use['name']}",
+            observation=tool_use.get("result", ""),
+        )
+        await reasoning.record_tool_call(
+            step_id=step.id,
+            tool_name=tool_use["name"],
+            arguments=tool_use.get("args", {}),
+            result=tool_use.get("result"),
+        )
+
+    await reasoning.complete_trace(
+        trace_id=trace.id,
+        outcome=assistant_message[:500] if assistant_message else None,
+        success=True,
+    )
 
 
 async def run_agent(
@@ -199,7 +275,18 @@ async def run_agent(
         ]
         response = ai_messages[-1].content if ai_messages else "No response."
 
-        await store_interaction(memory, user_id, user_message, response)
+        tool_uses = _collect_tool_uses(result["messages"])
+        await store_interaction(
+            memory, user_id, user_message, response,
+            tool_uses=tool_uses or None,
+        )
+        if tool_uses:
+            try:
+                await store_decision_trace(
+                    memory, user_id, user_message, response, tool_uses
+                )
+            except Exception:
+                pass
 
         return response
     finally:
@@ -296,30 +383,20 @@ async def run_agent_stream(
             return
 
         # Collect tool usage for metadata storage
-        tool_uses = []
-        if chunk is not None:
-            tool_calls_by_id = {}
-            for msg in chunk["messages"]:
-                if isinstance(msg, AIMessage) and msg.tool_calls:
-                    for tc in msg.tool_calls:
-                        tool_calls_by_id[tc.get("id", "")] = tc
-                if isinstance(msg, ToolMessage) and msg.tool_call_id:
-                    tc = tool_calls_by_id.get(msg.tool_call_id)
-                    if tc:
-                        result_preview = msg.content
-                        if not isinstance(result_preview, str):
-                            result_preview = json.dumps(result_preview, indent=2)
-                        if len(result_preview) > 500:
-                            result_preview = result_preview[:500] + "..."
-                        tool_uses.append({
-                            "name": tc["name"],
-                            "args": tc["args"],
-                            "result": result_preview,
-                        })
+        tool_uses = _collect_tool_uses(
+            chunk["messages"] if chunk is not None else []
+        )
 
         await store_interaction(
             memory, user_id, user_message, full_response,
             tool_uses=tool_uses or None,
         )
+        if tool_uses:
+            try:
+                await store_decision_trace(
+                    memory, user_id, user_message, full_response, tool_uses
+                )
+            except Exception:
+                pass
     finally:
         await memory_client.close()
