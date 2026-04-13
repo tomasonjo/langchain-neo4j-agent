@@ -109,6 +109,8 @@ def stream_response(prompt: str, session_id: str, user_id: str) -> dict:
                     elif etype == "tool_result":
                         tc_id = event.get("tool_call_id", "")
                         content = event.get("content", "")
+                        if not isinstance(content, str):
+                            content = json.dumps(content, indent=2)
                         active_tools.pop(tc_id, None)
                         result_preview = content[:500] + "..." if len(content) > 500 else content
                         for tu in tool_uses:

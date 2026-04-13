@@ -280,7 +280,9 @@ async def run_agent_stream(
                 if latest.id not in seen_tool_results:
                     seen_tool_results.add(latest.id)
                     content = latest.content
-                    if isinstance(content, str) and len(content) > 2000:
+                    if not isinstance(content, str):
+                        content = json.dumps(content, indent=2)
+                    if len(content) > 2000:
                         content = content[:2000] + "... (truncated)"
                     yield json.dumps({
                         "type": "tool_result",
@@ -310,7 +312,9 @@ async def run_agent_stream(
                 tc = tool_calls_by_id.get(msg.tool_call_id)
                 if tc:
                     result_preview = msg.content
-                    if isinstance(result_preview, str) and len(result_preview) > 500:
+                    if not isinstance(result_preview, str):
+                        result_preview = json.dumps(result_preview, indent=2)
+                    if len(result_preview) > 500:
                         result_preview = result_preview[:500] + "..."
                     tool_uses.append({
                         "name": tc["name"],
