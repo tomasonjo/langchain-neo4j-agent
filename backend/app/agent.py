@@ -89,11 +89,13 @@ nulls with a `WHERE prop IS NOT NULL` clause before ordering.
 def _create_agent_memory(
     memory_client: MemoryClient,
     session_id: str,
+    user_id: str = "default-user",
 ) -> Neo4jAgentMemory:
     """Create a Neo4jAgentMemory instance for the given session."""
     return Neo4jAgentMemory(
         memory_client=memory_client,
         session_id=session_id,
+        user_id=user_id,
         include_short_term=True,
         include_long_term=True,
         include_reasoning=True,
@@ -253,7 +255,7 @@ async def run_agent(
     await memory_client.connect()
 
     try:
-        memory = _create_agent_memory(memory_client, session_id)
+        memory = _create_agent_memory(memory_client, session_id, user_id=user_id)
         memory_context = await get_memory_context(memory, user_message)
 
         mcp_client = MultiServerMCPClient(get_mcp_config())
@@ -311,7 +313,7 @@ async def run_agent_stream(
     await memory_client.connect()
 
     try:
-        memory = _create_agent_memory(memory_client, session_id)
+        memory = _create_agent_memory(memory_client, session_id, user_id=user_id)
         memory_context = await get_memory_context(memory, user_message)
 
         mcp_client = MultiServerMCPClient(get_mcp_config())

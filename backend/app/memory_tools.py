@@ -160,11 +160,13 @@ class SearchConversationHistoryTool(BaseTool):
     )
     args_schema: type[BaseModel] = SearchConversationHistoryInput
     memory_client: MemoryClient
+    user_id: str = "default-user"
 
     async def _arun(self, query: str, limit: int = 5) -> str:
         messages = await self.memory_client.short_term.search_messages(
             query=query,
             limit=limit,
+            metadata_filters={"user_id": self.user_id},
         )
         if not messages:
             return "No relevant messages found."
@@ -187,5 +189,5 @@ def create_memory_tools(memory_client: MemoryClient, user_id: str = "default-use
         SearchEntitesTool(memory_client=memory_client),
         GetPreferencesTool(memory_client=memory_client, user_id=user_id),
         SavePreferenceTool(memory_client=memory_client, user_id=user_id),
-        SearchConversationHistoryTool(memory_client=memory_client),
+        SearchConversationHistoryTool(memory_client=memory_client, user_id=user_id),
     ]
