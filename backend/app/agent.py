@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain.agents import create_agent
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from neo4j_agent_memory import MemoryClient, MemorySettings
+from neo4j_agent_memory.integrations.langchain import Neo4jAgentMemory
 
 from app.memory_tools import create_memory_tools
 from app.config import (
@@ -85,62 +86,53 @@ nulls with a `WHERE prop IS NOT NULL` clause before ordering.
 """
 
 
-async def get_memory_context(
+def _create_agent_memory(
     memory_client: MemoryClient,
     session_id: str,
-    user_id: str,
+) -> Neo4jAgentMemory:
+    """Create a Neo4jAgentMemory instance for the given session."""
+    return Neo4jAgentMemory(
+        memory_client=memory_client,
+        session_id=session_id,
+        include_short_term=True,
+        include_long_term=True,
+        include_reasoning=True,
+        max_messages=10,
+        max_preferences=10,
+        max_traces=3,
+    )
+
+
+async def get_memory_context(
+    memory: Neo4jAgentMemory,
     current_message: str,
 ) -> str:
-    """Retrieve memory context: conversation history, user preferences, and entities."""
+    """Retrieve memory context using Neo4jAgentMemory integration."""
+    try:
+        variables = await memory._load_memory_variables_async(
+            {"input": current_message}
+        )
+    except Exception:
+        return "No prior context available."
+
     parts = []
 
-    # Get conversation history (short-term)
-    try:
-        conversation = await memory_client.short_term.get_conversation(
-            session_id=session_id,
-        )
-        if conversation.messages:
-            history_lines = []
-            for msg in conversation.messages[-10:]:
-                history_lines.append(f"  {msg.role}: {msg.content}")
-            parts.append(
-                "### Recent Conversation History\n" + "\n".join(history_lines)
-            )
-    except Exception:
-        pass
+    if variables.get("history"):
+        parts.append("### Recent Conversation History\n" + variables["history"])
 
-    # Get user preferences (long-term)
-    try:
-        preferences = await memory_client.long_term.search_preferences(
-            query=current_message,
-            limit=10,
-        )
-        if preferences:
-            pref_lines = [
-                f"  - [{p.category}] {p.preference}" for p in preferences
-            ]
-            parts.append(
-                "### User Preferences\n" + "\n".join(pref_lines)
-            )
-    except Exception:
-        pass
+    if variables.get("context"):
+        parts.append("### Memory Context\n" + variables["context"])
 
-    # Search for relevant entities (long-term)
-    try:
-        entities = await memory_client.long_term.search_entities(
-            query=current_message,
-            limit=5,
-        )
-        if entities:
-            entity_lines = [
-                f"  - {e.name} ({e.type}): {e.description or 'N/A'}"
-                for e in entities
-            ]
-            parts.append(
-                "### Related Entities from Memory\n" + "\n".join(entity_lines)
-            )
-    except Exception:
-        pass
+    if variables.get("preferences"):
+        pref_lines = [
+            f"  - [{p['category']}] {p['preference']}"
+            for p in variables["preferences"]
+        ]
+        if pref_lines:
+            parts.append("### User Preferences\n" + "\n".join(pref_lines))
+
+    if variables.get("similar_tasks"):
+        parts.append("### Similar Past Tasks\n" + variables["similar_tasks"])
 
     if not parts:
         return "No prior context available."
@@ -149,37 +141,26 @@ async def get_memory_context(
 
 
 async def store_interaction(
-    memory_client: MemoryClient,
-    session_id: str,
+    memory: Neo4jAgentMemory,
     user_id: str,
     user_message: str,
     assistant_message: str,
     tool_uses: list[dict] | None = None,
 ) -> None:
     """Store the interaction in memory (short-term + long-term extraction)."""
-    await memory_client.short_term.add_message(
-        session_id=session_id,
-        role="user",
-        content=user_message,
-        metadata={"user_id": user_id},
+    # Save short-term conversation via the integration
+    await memory._save_context_async(
+        {"input": user_message},
+        {"output": assistant_message},
     )
 
-    assistant_metadata = {"user_id": user_id}
-    if tool_uses:
-        assistant_metadata["tool_uses"] = tool_uses
-
-    await memory_client.short_term.add_message(
-        session_id=session_id,
-        role="assistant",
-        content=assistant_message,
-        metadata=assistant_metadata,
-    )
-
+    # Long-term extraction (entities, preferences) is not handled by the
+    # integration, so we call it directly on the memory client.
     try:
-        await memory_client.long_term.extract_and_store(
+        await memory.memory_client.long_term.extract_and_store(
             text=f"User: {user_message}\nAssistant: {assistant_message}",
             user_id=user_id,
-            session_id=session_id,
+            session_id=memory.session_id,
         )
     except Exception:
         pass
@@ -196,9 +177,8 @@ async def run_agent(
     await memory_client.connect()
 
     try:
-        memory_context = await get_memory_context(
-            memory_client, session_id, user_id, user_message
-        )
+        memory = _create_agent_memory(memory_client, session_id)
+        memory_context = await get_memory_context(memory, user_message)
 
         mcp_client = MultiServerMCPClient(get_mcp_config())
         mcp_tools = await mcp_client.get_tools()
@@ -219,9 +199,7 @@ async def run_agent(
         ]
         response = ai_messages[-1].content if ai_messages else "No response."
 
-        await store_interaction(
-            memory_client, session_id, user_id, user_message, response
-        )
+        await store_interaction(memory, user_id, user_message, response)
 
         return response
     finally:
@@ -246,9 +224,8 @@ async def run_agent_stream(
     await memory_client.connect()
 
     try:
-        memory_context = await get_memory_context(
-            memory_client, session_id, user_id, user_message
-        )
+        memory = _create_agent_memory(memory_client, session_id)
+        memory_context = await get_memory_context(memory, user_message)
 
         mcp_client = MultiServerMCPClient(get_mcp_config())
         mcp_tools = await mcp_client.get_tools()
@@ -341,7 +318,7 @@ async def run_agent_stream(
                         })
 
         await store_interaction(
-            memory_client, session_id, user_id, user_message, full_response,
+            memory, user_id, user_message, full_response,
             tool_uses=tool_uses or None,
         )
     finally:
