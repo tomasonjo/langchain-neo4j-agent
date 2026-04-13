@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.prebuilt import create_react_agent
 from neo4j_agent_memory import MemoryClient, MemorySettings
 
@@ -14,6 +15,7 @@ from app.config import (
     NEO4J_URI,
     NEO4J_USERNAME,
     NEO4J_PASSWORD,
+    NEO4J_DATABASE,
     NEO4J_MEMORY_URI,
     NEO4J_MEMORY_USERNAME,
     NEO4J_MEMORY_PASSWORD,
@@ -31,6 +33,7 @@ def get_mcp_config() -> dict:
                 "NEO4J_URI": NEO4J_URI,
                 "NEO4J_USERNAME": NEO4J_USERNAME,
                 "NEO4J_PASSWORD": NEO4J_PASSWORD,
+                "NEO4J_DATABASE": NEO4J_DATABASE,
             },
             "transport": "stdio",
         }
@@ -176,9 +179,10 @@ async def run_agent(
             memory_client, session_id, user_id, user_message
         )
 
-        # Build the agent with MCP tools
-        async with MultiServerMCPClient(get_mcp_config()) as mcp_client:
-            tools = mcp_client.get_tools()
+        # Build the agent with MCP tools (session must stay alive during agent execution)
+        mcp_client = MultiServerMCPClient(get_mcp_config())
+        async with mcp_client.session("neo4j") as session:
+            tools = await load_mcp_tools(session)
 
             llm = ChatOpenAI(model="gpt-4o", temperature=0)
 
@@ -220,8 +224,9 @@ async def run_agent_stream(
             memory_client, session_id, user_id, user_message
         )
 
-        async with MultiServerMCPClient(get_mcp_config()) as mcp_client:
-            tools = mcp_client.get_tools()
+        mcp_client = MultiServerMCPClient(get_mcp_config())
+        async with mcp_client.session("neo4j") as session:
+            tools = await load_mcp_tools(session)
             llm = ChatOpenAI(model="gpt-4o", temperature=0, streaming=True)
 
             system_message = SYSTEM_PROMPT.format(memory_context=memory_context)
